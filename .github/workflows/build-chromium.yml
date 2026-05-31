@@ -230,8 +230,6 @@ jobs:
             'ffmpeg_branding = "Chrome"' \
             'enable_nacl = false' \
             'use_vaapi = false' \
-            'enable_rust = false' \
-            'enable_pdf = false' \
             'enable_print_preview = false' \
             'enable_webui_tab_strip = false' \
             > $OUT/args.gn
