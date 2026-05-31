@@ -1,62 +1,69 @@
-# Cirrus CI - 免费用于公开仓库
-# https://cirrus-ci.com/github/你的用户名/仓库名
+# Cirrus CI - Chromium + Widevine for aarch64
+# 公开仓库免费：最大 8 CPU, 32GB RAM (arm64 on AWS Graviton2)
 
 env:
-  CIRRUS_CLONE_DEPTH: 1
   DEBIAN_FRONTEND: noninteractive
+  DEPOT_TOOLS: /tmp/depot_tools
+  CHROMIUM_SRC: /tmp/chromium/src
+  BUILD_DIR: out/Release
+
+# 定时触发：每周一 UTC 03:00
+only_if: $CIRRUS_BRANCH == 'main' || $CIRRUS_USER_COLLABORATOR == 'true'
 
 task:
-  # 公开仓库免费使用: 16 CPU, 32GB RAM, 200GB 磁盘
   name: "Build Chromium + Widevine (aarch64)"
 
-  # 使用 arm64 容器进行原生编译（不需要交叉编译）
+  # arm64 原生容器，最大 8 CPU / 32GB
   arm_container:
     image: debian:trixie
-    cpu: 16
+    cpu: 8
     memory: 32G
 
-  # 持久化磁盘 - 用于缓存 depot_tools 和编译产物
+  # 超时 5 小时
+  timeout_in: 300m
+
+  # 持久化磁盘（编译产物很大）
   persistent_disk:
     size: 200G
     type: ssd
 
-  # 超时 4 小时
-  timeout_in: 240m
+  # ===== 缓存 =====
+  # 缓存 depot_tools 避免每次重新下载
+  depot_tools_cache:
+    folder: $DEPOT_TOOLS
+    fingerprint_script: echo "depot-tools-v1"
 
-  # 只在 main 分支或手动触发时构建
-  only_if: $CIRRUS_BRANCH == 'main' || $CIRRUS_USER_COLLABORATOR == 'true'
-
-  # 版本号（可手动指定或自动获取最新）
-  env:
-    CHROMIUM_VERSION: ""
-    BUILD_DIR: /tmp/build
-    DEPOT_TOOLS: /tmp/depot_tools
-    CHROMIUM_SRC: /tmp/build/chromium/src
-
-  install_depot_tools_script: |
+  # ===== 安装依赖 =====
+  install_deps_script: |
     apt-get update
     apt-get install -y \
       git curl wget python3 python3-pip \
       lsb-release pkg-config gperf \
       build-essential clang lld llvm \
       libglib2.0-dev-bin libxml2-utils xsltproc \
-      squashfs-tools \
+      squashfs-tools nodejs npm \
       libasound2-dev libatk1.0-dev libatk-bridge2.0-dev \
       libcups2-dev libdrm-dev libgbm-dev libgtk-3-dev \
       libnss3-dev libpango1.0-dev libxcomposite-dev \
       libxdamage-dev libxrandr-dev libxkbcommon-dev \
       libwayland-dev libxcb1-dev libx11-dev \
-      nodejs npm
+      libcurl4-openssl-dev libpulse-dev \
+      libva-dev libvulkan-dev
 
-    git clone --depth 1 https://chromium.googlesource.com/chromium/tools/depot_tools.git $DEPOT_TOOLS
+  # ===== depot_tools =====
+  setup_depot_tools_script: |
+    if [ ! -d "$DEPOT_TOOLS" ]; then
+      git clone --depth 1 https://chromium.googlesource.com/chromium/tools/depot_tools.git $DEPOT_TOOLS
+    fi
     export PATH="$DEPOT_TOOLS:$PATH"
-    echo "export PATH=\"$DEPOT_TOOLS:\$PATH\"" >> ~/.bashrc
 
+  # ===== 获取 Chromium 源码 =====
   fetch_chromium_script: |
     export PATH="$DEPOT_TOOLS:$PATH"
-    mkdir -p $BUILD_DIR
-    cd $BUILD_DIR
+    mkdir -p /tmp/chromium
+    cd /tmp/chromium
 
+    # gclient 配置
     cat > .gclient << 'EOF'
     solutions = [{
       "name": "src",
@@ -66,30 +73,40 @@ task:
     target_os = ["linux"]
     EOF
 
-    # 获取最新稳定版或指定版本
-    if [ -n "$CHROMIUM_VERSION" ]; then
-      VERSION="$CHROMIUM_VERSION"
-    else
-      VERSION=$(curl -s 'https://chromiumdash.appspot.com/fetch/releases?channel=Stable&platform=Linux&num=1' | \
-        python3 -c "import sys,json; print(json.load(sys.stdin)[0]['version'])" 2>/dev/null || echo "main")
+    # 获取最新稳定版
+    VERSION=$(curl -s 'https://chromiumdash.appspot.com/fetch/releases?channel=Stable&platform=Linux&num=1' | \
+      python3 -c "import sys,json; print(json.load(sys.stdin)[0]['version'])" 2>/dev/null || echo "")
+    if [ -z "$VERSION" ]; then
+      VERSION="main"
     fi
-    echo "Building Chromium $VERSION"
+    echo "=== Building Chromium $VERSION ==="
 
     cd src
-    git init
-    git fetch --depth 1 https://chromium.googlesource.com/chromium/src.git "refs/tags/$VERSION" || \
+    if [ ! -d ".git" ]; then
+      git init
+    fi
+
+    # Shallow fetch
+    git fetch --depth 1 https://chromium.googlesource.com/chromium/src.git \
+      "refs/tags/$VERSION" 2>/dev/null || \
       git fetch --depth 1 https://chromium.googlesource.com/chromium/src.git main
     git checkout FETCH_HEAD
 
-    # 同步依赖
+    # 同步依赖（shallow + no history 节省空间）
     gclient sync --no-history --shallow -D --nohooks
+
+    # 安装 sysroot
+    python3 build/linux/sysroot_scripts/install-sysroot.py --arch=arm64
+
+    # 运行 hooks
     gclient runhooks
 
+  # ===== GN 配置 =====
   configure_script: |
     cd $CHROMIUM_SRC
-    mkdir -p $BUILD_DIR/out
+    mkdir -p $BUILD_DIR
 
-    cat > $BUILD_DIR/out/args.gn << 'EOF'
+    cat > $BUILD_DIR/args.gn << 'EOF'
     is_debug = false
     is_official_build = true
     is_component_build = false
@@ -101,122 +118,130 @@ task:
     enable_nacl = false
     use_vaapi = false
     exclude_unwind_tables = true
+    use_system_libffi = false
+    is_cfi = false
+    use_thin_lto = false
     EOF
 
-    gn gen $BUILD_DIR/out
+    gn gen $BUILD_DIR
 
+  # ===== 编译 =====
   build_script: |
     cd $CHROMIUM_SRC
-    autoninja -C out -j16 chrome
+    echo "=== Starting build with $(nproc) cores ==="
+    autoninja -C $BUILD_DIR -j$(nproc) chrome
 
+  # ===== Widevine CDM 修复 =====
   fixup_widevine_script: |
     cd $CHROMIUM_SRC
-    CDM_SRC="$BUILD_DIR/out/WidevineCdm/_platform_specific/linux_arm64/libwidevinecdm.so"
-    CDM_OUT="$BUILD_DIR/out/libwidevinecdm.so"
+    CDM_SRC="$BUILD_DIR/WidevineCdm/_platform_specific/linux_arm64/libwidevinecdm.so"
+    CDM_OUT="$BUILD_DIR/libwidevinecdm.so"
 
     if [ ! -f "$CDM_SRC" ]; then
-      CDM_SRC=$(find $BUILD_DIR/out -name "libwidevinecdm.so" -type f | head -1)
+      CDM_SRC=$(find $BUILD_DIR -name "libwidevinecdm.so" -type f | head -1)
     fi
 
-    echo "Fixing up CDM: $CDM_SRC"
+    echo "=== Widevine CDM fixup ==="
+    echo "Source: $CDM_SRC"
     python3 $CIRRUS_WORKING_DIR/widevine_fixup.py "$CDM_SRC" "$CDM_OUT"
+    ls -lh "$CDM_OUT"
 
+  # ===== 打包 =====
   package_script: |
     cd $CHROMIUM_SRC
     VERSION=$(cat chrome/VERSION | tr '\n' '.' | sed 's/\.$//')
-    PKG_NAME="chromium-widevine-aarch64-${VERSION}"
-    PKG_DIR="/tmp/${PKG_NAME}"
-    BUILD="$BUILD_DIR/out"
+    PKG="chromium-widevine-aarch64-${VERSION}"
+    PKG_DIR="/tmp/$PKG"
+    B="$BUILD_DIR"
 
-    mkdir -p "${PKG_DIR}/chromium" "${PKG_DIR}/widevine"
+    mkdir -p "$PKG_DIR/chromium" "$PKG_DIR/widevine"
 
-    # 复制 Chromium
+    # Chromium 文件
     for f in chrome chrome_crashpad_handler chrome-sandbox \
              icudtl.dat snapshot_blob.bin v8_context_snapshot.bin \
              resources.pak chrome_100_percent.pak chrome_200_percent.pak \
              libEGL.so libGLESv2.so libvk_swiftshader.so libvulkan.so.1; do
-      [ -f "$BUILD/$f" ] && cp -a "$BUILD/$f" "${PKG_DIR}/chromium/"
+      [ -f "$B/$f" ] && cp -a "$B/$f" "$PKG_DIR/chromium/"
     done
-    [ -d "$BUILD/locales" ] && cp -a "$BUILD/locales" "${PKG_DIR}/chromium/"
+    [ -d "$B/locales" ] && cp -a "$B/locales" "$PKG_DIR/chromium/"
 
-    # 复制 Widevine
-    cp "$BUILD/libwidevinecdm.so" "${PKG_DIR}/widevine/"
-    [ -f "$BUILD/WidevineCdm/manifest.json" ] && cp "$BUILD/WidevineCdm/manifest.json" "${PKG_DIR}/widevine/"
+    # Widevine
+    cp "$B/libwidevinecdm.so" "$PKG_DIR/widevine/"
+    [ -f "$B/WidevineCdm/manifest.json" ] && cp "$B/WidevineCdm/manifest.json" "$PKG_DIR/widevine/"
 
-    # 复制安装脚本
-    cp "$CIRRUS_WORKING_DIR/widevine_fixup.py" "${PKG_DIR}/"
+    # 附加文件
+    cp "$CIRRUS_WORKING_DIR/widevine_fixup.py" "$PKG_DIR/"
+    cp "$CIRRUS_WORKING_DIR/install.sh" "$PKG_DIR/" 2>/dev/null || true
 
-    # 生成安装脚本（同 GitHub Actions 版本）
-    cat > "${PKG_DIR}/install.sh" << 'EOF'
+    # 如果没有 install.sh，生成一个
+    if [ ! -f "$PKG_DIR/install.sh" ]; then
+      cat > "$PKG_DIR/install.sh" << 'INSTALLEOF'
     #!/bin/bash
     set -e
-    SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
-    INSTALL_DIR="/opt/chromium-widevine"
-    WIDEVINE_DIR="/var/lib/widevine"
-
-    echo "========================================="
-    echo " Chromium + Widevine Installer"
-    echo " aarch64 · 16K page size"
-    echo "========================================="
-
+    D="$(cd "$(dirname "$0")" && pwd)"
+    echo "Installing Chromium + Widevine for aarch64..."
     [ "$(uname -m)" != "aarch64" ] && echo "ERROR: aarch64 only" && exit 1
     [ "$(whoami)" != "root" ] && echo "ERROR: sudo ./install.sh" && exit 1
 
-    mkdir -p "$INSTALL_DIR" "$WIDEVINE_DIR"
-    cp -a "$SCRIPT_DIR/chromium/"* "$INSTALL_DIR/"
-    chmod +x "$INSTALL_DIR/chrome"
-    cp "$SCRIPT_DIR/widevine/libwidevinecdm.so" "$WIDEVINE_DIR/"
+    mkdir -p /opt/chromium-widevine /var/lib/widevine
+    cp -a "$D/chromium/"* /opt/chromium-widevine/
+    chmod +x /opt/chromium-widevine/chrome
+    cp "$D/widevine/libwidevinecdm.so" /var/lib/widevine/
+    [ -f "$D/widevine/manifest.json" ] && cp "$D/widevine/manifest.json" /var/lib/widevine/
 
-    # Widevine 目录结构
-    mkdir -p "$WIDEVINE_DIR/WidevineCdm/_platform_specific/linux_arm64"
-    mkdir -p "$WIDEVINE_DIR/WidevineCdm/_platform_specific/linux_x64"
-    [ -f "$SCRIPT_DIR/widevine/manifest.json" ] && \
-      cp "$SCRIPT_DIR/widevine/manifest.json" "$WIDEVINE_DIR/"
-    ln -sf "../../../manifest.json" "$WIDEVINE_DIR/WidevineCdm/manifest.json"
-    ln -sf "../../../libwidevinecdm.so" "$WIDEVINE_DIR/WidevineCdm/_platform_specific/linux_arm64/libwidevinecdm.so"
-    touch "$WIDEVINE_DIR/WidevineCdm/_platform_specific/linux_x64/libwidevinecdm.so"
+    # WidevineCdm 目录
+    W=/var/lib/widevine/WidevineCdm
+    mkdir -p "$W/_platform_specific/linux_arm64" "$W/_platform_specific/linux_x64"
+    [ -f /var/lib/widevine/manifest.json ] && ln -sf "../manifest.json" "$W/manifest.json"
+    ln -sf "../../libwidevinecdm.so" "$W/_platform_specific/linux_arm64/libwidevinecdm.so"
+    touch "$W/_platform_specific/linux_x64/libwidevinecdm.so"
 
     # Firefox GMP
-    mkdir -p "$WIDEVINE_DIR/gmp-widevinecdm/system-installed"
-    ln -sf "../../libwidevinecdm.so" "$WIDEVINE_DIR/gmp-widevinecdm/system-installed/libwidevinecdm.so"
-    ln -sf "../../manifest.json" "$WIDEVINE_DIR/gmp-widevinecdm/system-installed/manifest.json"
+    mkdir -p /var/lib/widevine/gmp-widevinecdm/system-installed
+    ln -sf "../../libwidevinecdm.so" /var/lib/widevine/gmp-widevinecdm/system-installed/libwidevinecdm.so
+    ln -sf "../../manifest.json" /var/lib/widevine/gmp-widevinecdm/system-installed/manifest.json
 
     # 启动器
-    cat > /usr/local/bin/chromium-widevine << 'LAUNCHER'
+    cat > /usr/local/bin/chromium-widevine << 'L'
     #!/bin/bash
     exec /opt/chromium-widevine/chrome "$@"
-    LAUNCHER
+    L
     chmod +x /usr/local/bin/chromium-widevine
 
     # Firefox 环境
     mkdir -p /usr/lib/environment.d
     echo 'MOZ_GMP_PATH=/var/lib/widevine/gmp-widevinecdm/system-installed' > /usr/lib/environment.d/50-gmpwidevine.conf
 
-    for dir in /usr/lib/firefox-esr /usr/lib/firefox /usr/lib64/firefox; do
-      if [ -d "$dir/defaults/pref" ]; then
-        cat > "$dir/defaults/pref/gmpwidevine.js" << 'FFPREF'
+    for d in /usr/lib/firefox-esr /usr/lib/firefox /usr/lib64/firefox; do
+      [ -d "$d/defaults/pref" ] && cat > "$d/defaults/pref/gmpwidevine.js" << 'P'
     pref("media.gmp-widevinecdm.version", "system-installed");
     pref("media.gmp-widevinecdm.visible", true);
     pref("media.gmp-widevinecdm.enabled", true);
     pref("media.gmp-widevinecdm.autoupdate", false);
     pref("media.eme.enabled", true);
-    pref("media.eme.encrypted-media-encryption-scheme.enabled", true);
-    FFPREF
-        break
-      fi
+    P
     done
 
     echo "Done! Run: chromium-widevine"
-    EOF
-    chmod +x "${PKG_DIR}/install.sh"
+    INSTALLEOF
+      chmod +x "$PKG_DIR/install.sh"
+    fi
 
     # 打包
     cd /tmp
-    tar czf "${PKG_NAME}.tar.gz" "${PKG_NAME}/"
-    ls -lh "${PKG_NAME}.tar.gz"
-    cp "${PKG_NAME}.tar.gz" $CIRRUS_WORKING_DIR/
+    tar czf "${PKG}.tar.gz" "$PKG/"
+    ls -lh "${PKG}.tar.gz"
+    cp "${PKG}.tar.gz" "$CIRRUS_WORKING_DIR/"
+    echo "$VERSION" > /tmp/VERSION
 
-  upload_artifacts_script: |
-    # Cirrus CI 自动上传 artifacts
-    echo "Build complete!"
-    ls -lh /tmp/chromium-widevine-aarch64-*.tar.gz
+  # ===== Artifacts =====
+  upload_artifacts:
+    type: application/gzip
+    path: "/tmp/chromium-widevine-aarch64-*.tar.gz"
+
+  # ===== 发布 =====
+  release_script: |
+    VERSION=$(cat /tmp/VERSION 2>/dev/null || echo "unknown")
+    echo "Build complete: Chromium $VERSION"
+    echo "Artifact: chromium-widevine-aarch64-${VERSION}.tar.gz"
+    # Cirrus CI 会自动上传 artifacts，可从 UI 下载
