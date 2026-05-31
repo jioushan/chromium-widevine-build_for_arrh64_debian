@@ -53,12 +53,12 @@ jobs:
 
       - name: Fetch Chromium
         run: |
-          mkdir -p /tmp/chromium && cd /tmp/chromium
-          cat > .gclient << 'EOF'
-          solutions = [{"name": "src", "url": "https://chromium.googlesource.com/chromium/src.git", "managed": False}]
-          target_os = ["linux"]
-          EOF
+          mkdir -p /tmp/chromium/src && cd /tmp/chromium
 
+          # gclient 配置（不能有缩进，否则 YAML heredoc 会带空格）
+          printf 'solutions = [{"name": "src", "url": "https://chromium.googlesource.com/chromium/src.git", "managed": False}]\ntarget_os = ["linux"]\n' > .gclient
+
+          # 确定版本
           if [ -n "${{ inputs.chromium_version }}" ]; then
             VER="${{ inputs.chromium_version }}"
           else
@@ -67,13 +67,21 @@ jobs:
           fi
           echo "version=$VER" >> $GITHUB_OUTPUT
           echo "VERSION=$VER" >> $GITHUB_ENV
+          echo "=== Chromium $VER ==="
 
-          cd src && git init
+          # 在 src 目录内做 git 操作
+          cd src
+          git init
           git fetch --depth 1 https://chromium.googlesource.com/chromium/src.git "refs/tags/$VER" || \
             git fetch --depth 1 https://chromium.googlesource.com/chromium/src.git main
           git checkout FETCH_HEAD
 
+          # gclient sync 在父目录执行（读 .gclient）
+          cd /tmp/chromium
           gclient sync --no-history --shallow -D --nohooks
+
+          # sysroot 和 hooks
+          cd /tmp/chromium/src
           python3 build/linux/sysroot_scripts/install-sysroot.py --arch=arm64
           gclient runhooks
 
@@ -193,43 +201,38 @@ jobs:
           cd $CHROMIUM
           mkdir -p $OUT
 
-          cat > $OUT/args.gn << 'EOF'
-          # === 交叉编译 ===
-          target_cpu = "arm64"
-          target_os = "linux"
+          # 用 printf 写 args.gn（heredoc 在 YAML run block 里有缩进问题）
+          printf '%s\n' \
+            'target_cpu = "arm64"' \
+            'target_os = "linux"' \
+            'is_debug = false' \
+            'is_official_build = true' \
+            'is_component_build = true' \
+            'symbol_level = 0' \
+            'blink_symbol_level = 0' \
+            'v8_symbol_level = 0' \
+            'exclude_unwind_tables = true' \
+            'enable_resource_allowlist_generation = false' \
+            'dcheck_always_on = false' \
+            'use_custom_libcxx = false' \
+            'use_system_zlib = true' \
+            'use_lld = true' \
+            'is_cfi = false' \
+            'use_thin_lto = false' \
+            'use_gold = false' \
+            'proprietary_codecs = true' \
+            'enable_widevine = true' \
+            'ffmpeg_branding = "Chrome"' \
+            'enable_nacl = false' \
+            'use_vaapi = false' \
+            'enable_rust = false' \
+            'enable_pdf = false' \
+            'enable_print_preview = false' \
+            'enable_webui_tab_strip = false' \
+            > $OUT/args.gn
 
-          # === 极限优化 ===
-          is_debug = false
-          is_official_build = true
-          is_component_build = true
-          symbol_level = 0
-          blink_symbol_level = 0
-          v8_symbol_level = 0
-          exclude_unwind_tables = true
-          enable_resource_allowlist_generation = false
-          dcheck_always_on = false
-
-          # === 减小编译量 ===
-          use_custom_libcxx = false
-          use_system_zlib = true
-          use_lld = true
-          is_cfi = false
-          use_thin_lto = false
-          use_gold = false
-
-          # === Widevine + 编解码器 ===
-          proprietary_codecs = true
-          enable_widevine = true
-          ffmpeg_branding = "Chrome"
-
-          # === 关闭不需要的功能 ===
-          enable_nacl = false
-          use_vaapi = false
-          enable_rust = false
-          enable_pdf = false
-          enable_print_preview = false
-          enable_webui_tab_strip = false
-          EOF
+          echo "=== args.gn ==="
+          cat $OUT/args.gn
 
           gn gen $OUT
           echo "=== GN done ==="
