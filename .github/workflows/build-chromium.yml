@@ -1,350 +1,207 @@
-name: Build Chromium with Widevine
+name: Build Chromium + Widevine (aarch64 cross-compile)
 
 on:
   schedule:
-    # 每周一凌晨 3 点 UTC
-    - cron: '0 3 * * 1'
+    - cron: '0 3 * * 1'  # 每周一 UTC 03:00
   workflow_dispatch:
     inputs:
       chromium_version:
-        description: 'Chromium version (leave empty for latest stable)'
+        description: 'Chromium version tag (empty = latest stable)'
         required: false
-        type: string
 
 env:
-  DEPOT_TOOLS: /opt/depot_tools
-  CHROMIUM_SRC: /opt/chromium-src/src
-  BUILD_DIR: out/Release
+  DEPOT_TOOLS: /tmp/depot_tools
+  CHROMIUM: /tmp/chromium/src
+  OUT: out/Release
 
 jobs:
   build:
-    # 使用更大的 runner（免费 tier 磁盘不够编译 Chromium）
-    # 如果你有 self-hosted runner 可以改成 runs-on: [self-hosted, linux, x64]
-    runs-on: ubuntu-latest-xl
-    timeout-minutes: 360
+    runs-on: ubuntu-24.04
+    timeout-minutes: 340
 
     steps:
-      - name: Checkout
+      - name: Checkout repo
         uses: actions/checkout@v4
 
+      # ========== 极限清理磁盘 ==========
       - name: Free disk space
         run: |
-          echo "=== Before ==="
+          echo "=== BEFORE ==="
           df -h /
-          sudo swapoff -a
-          sudo rm -f /swapfile
+          sudo swapoff -a && sudo rm -f /swapfile
           sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc
-          sudo apt-get purge -y '^dotnet-.*' '^aspnetcore-.*' 2>/dev/null || true
+          sudo rm -rf /usr/local/share/powershell /usr/local/.ghcup
+          sudo rm -rf /usr/share/swift /usr/local/graalvm /usr/local/share/chromium
+          sudo rm -rf /usr/share/miniconda /usr/local/lib/node_modules
+          sudo apt-get purge -y '^dotnet-.*' '^aspnetcore-.*' '^llvm-.*' '^ghc-.*' 2>/dev/null
           sudo apt-get autoremove -y
           sudo apt-get clean
-          echo "=== After ==="
+          sudo rm -rf /var/lib/apt/lists/*
+          echo "=== AFTER ==="
           df -h /
 
-      - name: Install system dependencies
+      # ========== 系统依赖 ==========
+      - name: Install dependencies
         run: |
           sudo apt-get update
-          sudo apt-get install -y \
-            python3 python3-pip git curl lsb-release wget \
+          sudo apt-get install -y --no-install-recommends \
+            python3 git curl lsb-release wget pkg-config gperf \
             g++-aarch64-linux-gnu gcc-aarch64-linux-gnu \
             binutils-aarch64-linux-gnu \
-            libncurses5 pkg-config \
             libxml2-utils xsltproc \
-            squashfs-tools \
-            libglib2.0-dev-bin \
-            gperf
+            squashfs-tools
+          sudo rm -rf /var/lib/apt/lists/*
 
-      - name: Install depot_tools
+      # ========== depot_tools ==========
+      - name: Setup depot_tools
         run: |
-          git clone --depth 1 https://chromium.googlesource.com/chromium/tools/depot_tools.git ${{ env.DEPOT_TOOLS }}
-          echo "${{ env.DEPOT_TOOLS }}" >> $GITHUB_PATH
+          git clone --depth 1 https://chromium.googlesource.com/chromium/tools/depot_tools.git $DEPOT_TOOLS
+          echo "$DEPOT_TOOLS" >> $GITHUB_PATH
 
+      # ========== 获取 Chromium 源码 ==========
       - name: Fetch Chromium source
         run: |
-          mkdir -p ${{ env.CHROMIUM_SRC }}/..
-          cd ${{ env.CHROMIUM_SRC }}/../..
+          mkdir -p /tmp/chromium && cd /tmp/chromium
 
-          # 初始化 gclient 配置
           cat > .gclient << 'EOF'
-          solutions = [
-            {
-              "name": "src",
-              "url": "https://chromium.googlesource.com/chromium/src.git",
-              "managed": False,
-              "custom_deps": {},
-              "custom_vars": {},
-            },
-          ]
+          solutions = [{"name": "src", "url": "https://chromium.googlesource.com/chromium/src.git", "managed": False}]
           target_os = ["linux"]
           EOF
 
-          # 获取指定版本或最新稳定版
+          # 确定版本
           if [ -n "${{ inputs.chromium_version }}" ]; then
             VERSION="${{ inputs.chromium_version }}"
           else
-            # 获取最新 milestone 的版本号
-            MILESTONE=$(curl -s 'https://chromiumdash.appspot.com/fetch/milestones' | \
-              python3 -c "import sys,json; ms=json.load(sys.stdin); print(ms[-1]['milestone'])" 2>/dev/null || echo "")
-            if [ -n "$MILESTONE" ]; then
-              VERSION=$(curl -s "https://chromiumdash.appspot.com/fetch/releases?channel=Stable&platform=Linux&num=1" | \
-                python3 -c "import sys,json; r=json.load(sys.stdin); print(r[0]['version'])" 2>/dev/null || echo "main")
-            else
-              VERSION="main"
-            fi
+            VERSION=$(curl -s 'https://chromiumdash.appspot.com/fetch/releases?channel=Stable&platform=Linux&num=1' | \
+              python3 -c "import sys,json; print(json.load(sys.stdin)[0]['version'])" 2>/dev/null || echo "main")
           fi
-          echo "CHROMIUM_VERSION=$VERSION" >> $GITHUB_ENV
-          echo "Building Chromium version: $VERSION"
+          echo "VERSION=$VERSION" >> $GITHUB_ENV
+          echo "=== Chromium $VERSION ==="
 
-          # Shallow clone 节省空间
-          cd src
-          git init
+          cd src && git init
           git fetch --depth 1 https://chromium.googlesource.com/chromium/src.git "refs/tags/$VERSION" || \
             git fetch --depth 1 https://chromium.googlesource.com/chromium/src.git main
           git checkout FETCH_HEAD
 
-          # 同步依赖（shallow）
+          # 同步依赖（极限 shallow）
           gclient sync --no-history --shallow -D --nohooks
 
-          # 安装 sysroot（交叉编译用）
+          # 安装 arm64 sysroot（交叉编译必须）
           python3 build/linux/sysroot_scripts/install-sysroot.py --arch=arm64
 
           # 运行 hooks
           gclient runhooks
 
+          echo "=== Source disk usage ==="
+          du -sh /tmp/chromium 2>/dev/null
+          df -h /
+
+      # ========== GN 配置 ==========
       - name: Configure (GN)
         run: |
-          cd ${{ env.CHROMIUM_SRC }}
-          mkdir -p ${{ env.BUILD_DIR }}
+          cd $CHROMIUM
+          mkdir -p $OUT
 
-          cat > ${{ env.BUILD_DIR }}/args.gn << 'EOF'
-          # === Target ===
+          cat > $OUT/args.gn << 'EOF'
+          # === Target (交叉编译) ===
           target_cpu = "arm64"
           target_os = "linux"
 
-          # === Build type ===
+          # === 极限优化磁盘/内存 ===
           is_debug = false
           is_official_build = true
           is_component_build = false
           symbol_level = 0
           blink_symbol_level = 0
+          v8_symbol_level = 0
+          exclude_unwind_tables = true
+          enable_resource_allowlist_generation = false
 
-          # === Widevine + Proprietary codecs (核心!) ===
+          # === Widevine + 编解码器（核心！）===
           proprietary_codecs = true
           enable_widevine = true
           ffmpeg_branding = "Chrome"
 
-          # === Optimizations ===
+          # === 减小体积 ===
           enable_nacl = false
           use_vaapi = false
           use_system_libffi = false
-          exclude_unwind_tables = true
-          enable_resource_allowlist_generation = false
-
-          # === Reduce size ===
           is_cfi = false
           use_thin_lto = false
+          use_lld = true
+          dcheck_always_on = false
           EOF
 
-          gn gen ${{ env.BUILD_DIR }}
+          gn gen $OUT
 
-      - name: Build
+      # ========== 编译 ==========
+      - name: Build Chromium
         run: |
-          cd ${{ env.CHROMIUM_SRC }}
-          JOBS=$(nproc)
-          echo "Building with $JOBS jobs..."
-          autoninja -C ${{ env.BUILD_DIR }} -j$JOBS chrome
+          cd $CHROMIUM
+          echo "=== Building with $(nproc) cores ==="
+          df -h /
 
-      - name: Fixup Widevine CDM (16K page alignment)
+          # 只编译 chrome 主程序，不编译测试等
+          autoninja -C $OUT -j$(nproc) chrome
+
+          echo "=== Build disk usage ==="
+          du -sh $OUT
+          df -h /
+
+      # ========== Widevine CDM 修复 ==========
+      - name: Fixup Widevine CDM
         run: |
-          cd ${{ env.CHROMIUM_SRC }}
-          CDM_SRC="${{ env.BUILD_DIR }}/WidevineCdm/_platform_specific/linux_arm64/libwidevinecdm.so"
-          CDM_OUT="${{ env.BUILD_DIR }}/libwidevinecdm.so"
+          cd $CHROMIUM
+          CDM="$OUT/WidevineCdm/_platform_specific/linux_arm64/libwidevinecdm.so"
 
-          if [ ! -f "$CDM_SRC" ]; then
-            # 尝试其他路径
-            CDM_SRC=$(find ${{ env.BUILD_DIR }} -name "libwidevinecdm.so" -type f | head -1)
+          if [ ! -f "$CDM" ]; then
+            CDM=$(find $OUT -name "libwidevinecdm.so" -type f | head -1)
           fi
 
-          if [ -f "$CDM_SRC" ]; then
-            echo "Found CDM at: $CDM_SRC"
-            echo "Running widevine_fixup.py..."
-            python3 $GITHUB_WORKSPACE/widevine_fixup.py "$CDM_SRC" "$CDM_OUT"
-            echo "Fixup complete. Output: $CDM_OUT"
-            ls -lh "$CDM_OUT"
-          else
-            echo "ERROR: Widevine CDM not found!"
-            echo "Searching build output..."
-            find ${{ env.BUILD_DIR }} -name "*widevine*" -type f 2>/dev/null
-            exit 1
-          fi
+          echo "CDM found: $CDM"
+          python3 $GITHUB_WORKSPACE/widevine_fixup.py "$CDM" "$OUT/libwidevinecdm.so"
+          ls -lh "$OUT/libwidevinecdm.so"
 
+      # ========== 打包 ==========
       - name: Package
         run: |
-          cd ${{ env.CHROMIUM_SRC }}
-          VERSION="${{ env.CHROMIUM_VERSION }}"
-          PKG_NAME="chromium-widevine-aarch64-${VERSION}"
-          PKG_DIR="/tmp/${PKG_NAME}"
+          cd $CHROMIUM
+          V="$VERSION"
+          PKG="chromium-widevine-aarch64-${V}"
+          D="/tmp/$PKG"
+          B="$OUT"
 
-          mkdir -p "${PKG_DIR}/chromium"
-          mkdir -p "${PKG_DIR}/widevine"
+          mkdir -p "$D/chromium" "$D/widevine"
 
-          # === Chromium 二进制和资源 ===
-          echo "Packaging Chromium..."
-          BUILD="${{ env.BUILD_DIR }}"
-
-          # 主程序
-          for f in chrome chrome_crashpad_handler chrome-sandbox; do
-            [ -f "$BUILD/$f" ] && cp -a "$BUILD/$f" "${PKG_DIR}/chromium/"
-          done
-          chmod +x "${PKG_DIR}/chromium/chrome" 2>/dev/null
-
-          # 资源文件
-          for f in icudtl.dat snapshot_blob.bin v8_context_snapshot.bin \
+          # Chromium 二进制和资源
+          for f in chrome chrome_crashpad_handler chrome-sandbox \
+                   icudtl.dat snapshot_blob.bin v8_context_snapshot.bin \
                    resources.pak chrome_100_percent.pak chrome_200_percent.pak \
-                   v8_context_snapshot.bin; do
-            [ -f "$BUILD/$f" ] && cp -a "$BUILD/$f" "${PKG_DIR}/chromium/"
+                   libEGL.so libGLESv2.so libvk_swiftshader.so libvulkan.so.1; do
+            [ -f "$B/$f" ] && cp -a "$B/$f" "$D/chromium/"
           done
+          [ -d "$B/locales" ] && cp -a "$B/locales" "$D/chromium/"
 
-          # 共享库
-          for f in libEGL.so libGLESv2.so libvk_swiftshader.so libvulkan.so.1; do
-            [ -f "$BUILD/$f" ] && cp -a "$BUILD/$f" "${PKG_DIR}/chromium/"
-          done
+          # strip 二进制减小体积
+          aarch64-linux-gnu-strip "$D/chromium/chrome" 2>/dev/null || true
 
-          # Locales
-          [ -d "$BUILD/locales" ] && cp -a "$BUILD/locales" "${PKG_DIR}/chromium/"
+          # Widevine CDM
+          cp "$B/libwidevinecdm.so" "$D/widevine/"
+          [ -f "$B/WidevineCdm/manifest.json" ] && cp "$B/WidevineCdm/manifest.json" "$D/widevine/"
 
-          # === Widevine CDM ===
-          echo "Packaging Widevine CDM..."
-          cp "$BUILD/libwidevinecdm.so" "${PKG_DIR}/widevine/"
-          [ -f "$BUILD/WidevineCdm/manifest.json" ] && \
-            cp "$BUILD/WidevineCdm/manifest.json" "${PKG_DIR}/widevine/"
+          # 安装脚本
+          cp "$GITHUB_WORKSPACE/widevine_fixup.py" "$D/"
+          cp "$GITHUB_WORKSPACE/install.sh" "$D/"
 
-          # === 安装脚本 ===
-          cp "$GITHUB_WORKSPACE/widevine_fixup.py" "${PKG_DIR}/"
-          cp "$GITHUB_WORKSPACE/LICENSE" "${PKG_DIR}/" 2>/dev/null || true
-
-          cat > "${PKG_DIR}/install.sh" << 'EOF'
-          #!/bin/bash
-          set -e
-
-          SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
-          INSTALL_DIR="/opt/chromium-widevine"
-          WIDEVINE_DIR="/var/lib/widevine"
-
-          echo "========================================="
-          echo " Chromium + Widevine Installer"
-          echo " Target: aarch64 Linux (16K page size)"
-          echo "========================================="
-          echo
-
-          if [ "$(uname -m)" != "aarch64" ]; then
-            echo "ERROR: This package is for aarch64 systems only."
-            exit 1
-          fi
-
-          if [ "$(whoami)" != "root" ]; then
-            echo "ERROR: Run as root: sudo ./install.sh"
-            exit 1
-          fi
-
-          echo "Installing Chromium to ${INSTALL_DIR}..."
-          mkdir -p "$INSTALL_DIR"
-          cp -a "$SCRIPT_DIR/chromium/"* "$INSTALL_DIR/"
-          chmod +x "$INSTALL_DIR/chrome"
-
-          echo "Installing Widevine CDM to ${WIDEVINE_DIR}..."
-          mkdir -p "$WIDEVINE_DIR"
-          cp "$SCRIPT_DIR/widevine/libwidevinecdm.so" "$WIDEVINE_DIR/"
-          [ -f "$SCRIPT_DIR/widevine/manifest.json" ] && \
-            cp "$SCRIPT_DIR/widevine/manifest.json" "$WIDEVINE_DIR/"
-
-          # WidevineCdm 目录结构（给 Chromium 用）
-          mkdir -p "$WIDEVINE_DIR/WidevineCdm/_platform_specific/linux_arm64"
-          mkdir -p "$WIDEVINE_DIR/WidevineCdm/_platform_specific/linux_x64"
-          ln -sf "../../../manifest.json" "$WIDEVINE_DIR/WidevineCdm/manifest.json"
-          ln -sf "../../../libwidevinecdm.so" \
-            "$WIDEVINE_DIR/WidevineCdm/_platform_specific/linux_arm64/libwidevinecdm.so"
-          touch "$WIDEVINE_DIR/WidevineCdm/_platform_specific/linux_x64/libwidevinecdm.so"
-
-          # Firefox GMP 路径
-          mkdir -p "$WIDEVINE_DIR/gmp-widevinecdm/system-installed"
-          ln -sf "../../libwidevinecdm.so" \
-            "$WIDEVINE_DIR/gmp-widevinecdm/system-installed/libwidevinecdm.so"
-          ln -sf "../../manifest.json" \
-            "$WIDEVINE_DIR/gmp-widevinecdm/system-installed/manifest.json"
-
-          # 启动脚本
-          cat > /usr/local/bin/chromium-widevine << LAUNCHER
-          #!/bin/bash
-          exec "$INSTALL_DIR/chrome" \\
-            --enable-features=PlatformHEVCDecoderSupport \\
-            "\$@"
-          LAUNCHER
-          chmod +x /usr/local/bin/chromium-widevine
-
-          # Firefox 环境变量
-          cat > /etc/profile.d/chromium-widevine.sh << 'PROFILE'
-          MOZ_GMP_PATH="${MOZ_GMP_PATH}${MOZ_GMP_PATH:+:}/var/lib/widevine/gmp-widevinecdm/system-installed"
-          export MOZ_GMP_PATH
-          PROFILE
-
-          # systemd environment.d
-          mkdir -p /usr/lib/environment.d
-          cat > /usr/lib/environment.d/50-gmpwidevine.conf << 'ENVCONF'
-          MOZ_GMP_PATH=/var/lib/widevine/gmp-widevinecdm/system-installed
-          ENVCONF
-
-          # Firefox pref
-          FIREFOX_PREF=""
-          for dir in /usr/lib/firefox-esr /usr/lib/firefox /usr/lib64/firefox; do
-            if [ -d "$dir/defaults/pref" ]; then
-              FIREFOX_PREF="$dir/defaults/pref"
-              break
-            fi
-          done
-          if [ -n "$FIREFOX_PREF" ]; then
-            cat > "$FIREFOX_PREF/gmpwidevine.js" << 'FFPREF'
-          pref("media.gmp-widevinecdm.version", "system-installed");
-          pref("media.gmp-widevinecdm.visible", true);
-          pref("media.gmp-widevinecdm.enabled", true);
-          pref("media.gmp-widevinecdm.autoupdate", false);
-          pref("media.eme.enabled", true);
-          pref("media.eme.encrypted-media-encryption-scheme.enabled", true);
-          FFPREF
-            echo "Firefox pref installed at: $FIREFOX_PREF/gmpwidevine.js"
-          fi
-
-          # Desktop entry
-          cat > /usr/share/applications/chromium-widevine.desktop << DESKTOP
-          [Desktop Entry]
-          Name=Chromium (Widevine)
-          Comment=Web Browser with Widevine DRM
-          Exec=/usr/local/bin/chromium-widevine %U
-          Terminal=false
-          Type=Application
-          Icon=chromium
-          Categories=Network;WebBrowser;
-          DESKTOP
-
-          echo
-          echo "========================================="
-          echo " Installation complete!"
-          echo ""
-          echo " Chromium:  /opt/chromium-widevine/chrome"
-          echo " Launcher:  chromium-widevine"
-          echo " Widevine:  $WIDEVINE_DIR"
-          echo ""
-          echo " Firefox will pick up Widevine after"
-          echo " re-login or: source /etc/profile.d/chromium-widevine.sh"
-          echo "========================================="
-          EOF
-          chmod +x "${PKG_DIR}/install.sh"
-
-          # 创建 tarball
+          # 打包
           cd /tmp
-          tar czf "${PKG_NAME}.tar.gz" "${PKG_NAME}/"
-          ls -lh "${PKG_NAME}.tar.gz"
-          echo "VERSION=$VERSION" >> /tmp/build-info.env
+          tar czf "${PKG}.tar.gz" "$PKG/"
+          ls -lh "${PKG}.tar.gz"
 
+          # 释放空间
+          rm -rf "$D"
+
+      # ========== Upload ==========
       - name: Upload artifact
         uses: actions/upload-artifact@v4
         with:
@@ -352,21 +209,17 @@ jobs:
           path: /tmp/chromium-widevine-aarch64-*.tar.gz
           retention-days: 90
 
-      - name: Release
-        if: github.event_name != 'workflow_dispatch' || inputs.chromium_version == ''
+      # ========== Release ==========
+      - name: Create release
         uses: softprops/action-gh-release@v2
         with:
-          tag_name: v${{ env.CHROMIUM_VERSION }}
-          name: "Chromium ${{ env.CHROMIUM_VERSION }} + Widevine (aarch64)"
+          tag_name: v${{ env.VERSION }}
+          name: "Chromium ${{ env.VERSION }} + Widevine (aarch64)"
           body: |
-            ## Chromium ${{ env.CHROMIUM_VERSION }} with Widevine DRM
+            ## Chromium ${{ env.VERSION }} with Widevine DRM
 
             **Target:** aarch64 Linux · 16K page size · Apple Silicon / Asahi Linux
-
-            ### Features
-            - Widevine CDM (Netflix, Disney+, Apple Music, Spotify...)
-            - H.264 / H.265 / VP8 / VP9 / AV1
-            - EME (Encrypted Media Extensions)
+            **Method:** x86_64 cross-compilation on GitHub Actions
 
             ### Install
             ```bash
