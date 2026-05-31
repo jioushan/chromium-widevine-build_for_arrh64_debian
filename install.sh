@@ -48,6 +48,7 @@ ln -sf "../../manifest.json" "$WIDEVINE_DIR/gmp-widevinecdm/system-installed/man
 echo "[3/4] Creating launcher..."
 cat > /usr/local/bin/chromium-widevine << 'LAUNCHER'
 #!/bin/bash
+export LD_LIBRARY_PATH="/opt/chromium-widevine${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
 exec /opt/chromium-widevine/chrome "$@"
 LAUNCHER
 chmod +x /usr/local/bin/chromium-widevine

@@ -1,12 +1,12 @@
-name: Build Chromium + Widevine (aarch64 cross-compile)
+name: Build Chromium + Widevine (aarch64)
 
 on:
   schedule:
-    - cron: '0 3 * * 1'  # 每周一 UTC 03:00
+    - cron: '0 3 * * 1'
   workflow_dispatch:
     inputs:
       chromium_version:
-        description: 'Chromium version tag (empty = latest stable)'
+        description: 'Chromium version (empty = latest stable)'
         required: false
 
 env:
@@ -15,137 +15,274 @@ env:
   OUT: out/Release
 
 jobs:
-  build:
+  # ============================================================
+  # Job 1: 获取源码 + 极限裁剪 + 打包上传
+  # ============================================================
+  prepare:
     runs-on: ubuntu-24.04
-    timeout-minutes: 340
-
+    timeout-minutes: 120
+    outputs:
+      version: ${{ steps.info.outputs.version }}
     steps:
-      - name: Checkout repo
-        uses: actions/checkout@v4
+      - uses: actions/checkout@v4
 
-      # ========== 极限清理磁盘 ==========
-      - name: Free disk space
+      - name: Free disk
         run: |
-          echo "=== BEFORE ==="
-          df -h /
           sudo swapoff -a && sudo rm -f /swapfile
           sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc
           sudo rm -rf /usr/local/share/powershell /usr/local/.ghcup
           sudo rm -rf /usr/share/swift /usr/local/graalvm /usr/local/share/chromium
           sudo rm -rf /usr/share/miniconda /usr/local/lib/node_modules
-          sudo apt-get purge -y '^dotnet-.*' '^aspnetcore-.*' '^llvm-.*' '^ghc-.*' 2>/dev/null
-          sudo apt-get autoremove -y
-          sudo apt-get clean
-          sudo rm -rf /var/lib/apt/lists/*
-          echo "=== AFTER ==="
+          sudo apt-get purge -y '^dotnet-.*' '^aspnetcore-.*' '^llvm-.*' 2>/dev/null
+          sudo apt-get autoremove -y && sudo apt-get clean
           df -h /
 
-      # ========== 系统依赖 ==========
-      - name: Install dependencies
+      - name: Install deps
         run: |
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends \
-            python3 git curl lsb-release wget pkg-config gperf \
+            python3 git curl pkg-config gperf \
             g++-aarch64-linux-gnu gcc-aarch64-linux-gnu \
-            binutils-aarch64-linux-gnu \
-            libxml2-utils xsltproc \
-            squashfs-tools
+            binutils-aarch64-linux-gnu libxml2-utils xsltproc
           sudo rm -rf /var/lib/apt/lists/*
 
-      # ========== depot_tools ==========
       - name: Setup depot_tools
         run: |
           git clone --depth 1 https://chromium.googlesource.com/chromium/tools/depot_tools.git $DEPOT_TOOLS
           echo "$DEPOT_TOOLS" >> $GITHUB_PATH
 
-      # ========== 获取 Chromium 源码 ==========
-      - name: Fetch Chromium source
+      - name: Fetch Chromium
         run: |
           mkdir -p /tmp/chromium && cd /tmp/chromium
-
           cat > .gclient << 'EOF'
           solutions = [{"name": "src", "url": "https://chromium.googlesource.com/chromium/src.git", "managed": False}]
           target_os = ["linux"]
           EOF
 
-          # 确定版本
           if [ -n "${{ inputs.chromium_version }}" ]; then
-            VERSION="${{ inputs.chromium_version }}"
+            VER="${{ inputs.chromium_version }}"
           else
-            VERSION=$(curl -s 'https://chromiumdash.appspot.com/fetch/releases?channel=Stable&platform=Linux&num=1' | \
+            VER=$(curl -s 'https://chromiumdash.appspot.com/fetch/releases?channel=Stable&platform=Linux&num=1' | \
               python3 -c "import sys,json; print(json.load(sys.stdin)[0]['version'])" 2>/dev/null || echo "main")
           fi
-          echo "VERSION=$VERSION" >> $GITHUB_ENV
-          echo "=== Chromium $VERSION ==="
+          echo "version=$VER" >> $GITHUB_OUTPUT
+          echo "VERSION=$VER" >> $GITHUB_ENV
 
           cd src && git init
-          git fetch --depth 1 https://chromium.googlesource.com/chromium/src.git "refs/tags/$VERSION" || \
+          git fetch --depth 1 https://chromium.googlesource.com/chromium/src.git "refs/tags/$VER" || \
             git fetch --depth 1 https://chromium.googlesource.com/chromium/src.git main
           git checkout FETCH_HEAD
 
-          # 同步依赖（极限 shallow）
           gclient sync --no-history --shallow -D --nohooks
-
-          # 安装 arm64 sysroot（交叉编译必须）
           python3 build/linux/sysroot_scripts/install-sysroot.py --arch=arm64
-
-          # 运行 hooks
           gclient runhooks
 
-          echo "=== Source disk usage ==="
-          du -sh /tmp/chromium 2>/dev/null
+      # ========== 极限裁剪源码 ==========
+      - name: Prune source tree
+        run: |
+          cd $CHROMIUM
+          echo "=== Before prune ==="
+          du -sh . 2>/dev/null
+
+          # 删除测试目录
+          find . -type d -name "test" -not -path "*/third_party/*" -exec rm -rf {} + 2>/dev/null
+          find . -type d -name "tests" -not -path "*/third_party/*" -exec rm -rf {} + 2>/dev/null
+          find . -type d -name "testdata" -exec rm -rf {} + 2>/dev/null
+          find . -type d -name "test_data" -exec rm -rf {} + 2>/dev/null
+
+          # 删除文档
+          rm -rf docs/ documentation/ site/docs/
+
+          # 删除不需要的平台代码
+          rm -rf chromeos/ chromeos/
+          rm -rf ios/ ios_webview/
+          rm -rf android_webview/
+          rm -rf weblayer/
+
+          # 删除 NaCl/PNaCl
+          rm -rf components/nacl* native_client/ pnacl/
+
+          # 删除 Rust（不需要）
+          rm -rf third_party/rust/ build/rust/
+
+          # 删除大型测试/模拟框架
+          rm -rf third_party/webgpu-cts/ third_party/dawn/
+          rm -rf third_party/blink/perf_tests/
+          rm -rf third_party/blink/web_tests/
+
+          # 删除 git 历史（源码已经是 shallow，再压缩）
+          find . -name ".git" -type d -exec rm -rf {} + 2>/dev/null
+
+          # 删除 .o 和 .a 等可能的缓存
+          find . -name "*.o" -delete 2>/dev/null
+          find . -name "*.a" -delete 2>/dev/null
+
+          echo "=== After prune ==="
+          du -sh . 2>/dev/null
           df -h /
 
-      # ========== GN 配置 ==========
-      - name: Configure (GN)
+      # ========== 打包裁剪后的源码 ==========
+      - name: Archive pruned source
+        run: |
+          cd /tmp
+          tar czf chromium-pruned.tar.gz chromium/
+          ls -lh chromium-pruned.tar.gz
+
+      - name: Upload source
+        uses: actions/upload-artifact@v4
+        with:
+          name: chromium-source
+          path: /tmp/chromium-pruned.tar.gz
+          retention-days: 1
+
+  # ============================================================
+  # Job 2: 交叉编译 + 打包
+  # ============================================================
+  build:
+    needs: prepare
+    runs-on: ubuntu-24.04
+    timeout-minutes: 300
+    env:
+      VERSION: ${{ needs.prepare.outputs.version }}
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Free disk
+        run: |
+          sudo swapoff -a && sudo rm -f /swapfile
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc
+          sudo rm -rf /usr/local/share/powershell /usr/local/.ghcup
+          sudo rm -rf /usr/share/swift /usr/local/graalvm /usr/local/share/chromium
+          sudo rm -rf /usr/share/miniconda /usr/local/lib/node_modules
+          sudo apt-get purge -y '^dotnet-.*' '^aspnetcore-.*' '^llvm-.*' 2>/dev/null
+          sudo apt-get autoremove -y && sudo apt-get clean
+          df -h /
+
+      - name: Install deps
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            python3 git curl pkg-config gperf \
+            g++-aarch64-linux-gnu gcc-aarch64-linux-gnu \
+            binutils-aarch64-linux-gnu libxml2-utils xsltproc \
+            squashfs-tools
+          sudo rm -rf /var/lib/apt/lists/*
+
+      - name: Setup depot_tools
+        run: |
+          git clone --depth 1 https://chromium.googlesource.com/chromium/tools/depot_tools.git $DEPOT_TOOLS
+          echo "$DEPOT_TOOLS" >> $GITHUB_PATH
+
+      - name: Download pruned source
+        uses: actions/download-artifact@v4
+        with:
+          name: chromium-source
+          path: /tmp/
+
+      - name: Extract source
+        run: |
+          cd /tmp && tar xzf chromium-pruned.tar.gz
+          rm chromium-pruned.tar.gz
+          echo "=== Disk after extract ==="
+          df -h /
+
+      # ========== GN 配置（极限优化磁盘） ==========
+      - name: Configure
         run: |
           cd $CHROMIUM
           mkdir -p $OUT
 
           cat > $OUT/args.gn << 'EOF'
-          # === Target (交叉编译) ===
+          # === 交叉编译 ===
           target_cpu = "arm64"
           target_os = "linux"
 
-          # === 极限优化磁盘/内存 ===
+          # === 极限优化 ===
           is_debug = false
           is_official_build = true
-          is_component_build = false
+          is_component_build = true
           symbol_level = 0
           blink_symbol_level = 0
           v8_symbol_level = 0
           exclude_unwind_tables = true
           enable_resource_allowlist_generation = false
+          dcheck_always_on = false
 
-          # === Widevine + 编解码器（核心！）===
+          # === 减小编译量 ===
+          use_custom_libcxx = false
+          use_system_zlib = true
+          use_lld = true
+          is_cfi = false
+          use_thin_lto = false
+          use_gold = false
+
+          # === Widevine + 编解码器 ===
           proprietary_codecs = true
           enable_widevine = true
           ffmpeg_branding = "Chrome"
 
-          # === 减小体积 ===
+          # === 关闭不需要的功能 ===
           enable_nacl = false
           use_vaapi = false
-          use_system_libffi = false
-          is_cfi = false
-          use_thin_lto = false
-          use_lld = true
-          dcheck_always_on = false
+          enable_rust = false
+          enable_pdf = false
+          enable_print_preview = false
+          enable_webui_tab_strip = false
           EOF
 
           gn gen $OUT
-
-      # ========== 编译 ==========
-      - name: Build Chromium
-        run: |
-          cd $CHROMIUM
-          echo "=== Building with $(nproc) cores ==="
+          echo "=== GN done ==="
           df -h /
 
-          # 只编译 chrome 主程序，不编译测试等
-          autoninja -C $OUT -j$(nproc) chrome
+      # ========== 分阶段编译 + 清理中间产物 ==========
+      - name: "Stage 1: Build base libraries"
+        run: |
+          cd $CHROMIUM
+          echo "=== Stage 1: base, crypto, net, url ==="
+          autoninja -C $OUT -j$(nproc) \
+            base/base \
+            crypto/crypto \
+            net/net \
+            url/url \
+            components/components \
+            third_party/blink/common 2>&1 | tail -5
+          echo "=== Disk after stage 1 ==="
+          df -h /
 
-          echo "=== Build disk usage ==="
-          du -sh $OUT
+      - name: "Stage 1 cleanup"
+        run: |
+          cd $CHROMIUM/$OUT
+          # 保留 .ninja 和最终产物，清理 .o 中间文件
+          find . -name "*.o" -delete 2>/dev/null
+          find . -name "*.d" -delete 2>/dev/null
+          echo "=== Disk after cleanup ==="
+          df -h /
+
+      - name: "Stage 2: Build blink + content"
+        run: |
+          cd $CHROMIUM
+          echo "=== Stage 2: blink, content ==="
+          autoninja -C $OUT -j$(nproc) \
+            third_party/blink/renderer \
+            content/content 2>&1 | tail -5
+          echo "=== Disk after stage 2 ==="
+          df -h /
+
+      - name: "Stage 2 cleanup"
+        run: |
+          cd $CHROMIUM/$OUT
+          find . -name "*.o" -delete 2>/dev/null
+          find . -name "*.d" -delete 2>/dev/null
+          echo "=== Disk after cleanup ==="
+          df -h /
+
+      - name: "Stage 3: Build chrome + widevine"
+        run: |
+          cd $CHROMIUM
+          echo "=== Stage 3: chrome ==="
+          autoninja -C $OUT -j$(nproc) chrome 2>&1 | tail -5
+          echo "=== Disk after stage 3 ==="
           df -h /
 
       # ========== Widevine CDM 修复 ==========
@@ -153,14 +290,9 @@ jobs:
         run: |
           cd $CHROMIUM
           CDM="$OUT/WidevineCdm/_platform_specific/linux_arm64/libwidevinecdm.so"
-
-          if [ ! -f "$CDM" ]; then
-            CDM=$(find $OUT -name "libwidevinecdm.so" -type f | head -1)
-          fi
-
-          echo "CDM found: $CDM"
+          [ ! -f "$CDM" ] && CDM=$(find $OUT -name "libwidevinecdm.so" -type f | head -1)
+          echo "CDM: $CDM"
           python3 $GITHUB_WORKSPACE/widevine_fixup.py "$CDM" "$OUT/libwidevinecdm.so"
-          ls -lh "$OUT/libwidevinecdm.so"
 
       # ========== 打包 ==========
       - name: Package
@@ -182,10 +314,17 @@ jobs:
           done
           [ -d "$B/locales" ] && cp -a "$B/locales" "$D/chromium/"
 
-          # strip 二进制减小体积
-          aarch64-linux-gnu-strip "$D/chromium/chrome" 2>/dev/null || true
+          # 组件库（is_component_build=true 会产生 .so）
+          for f in libbase.so libcontent.so libblink_core.so libblink_modules.so \
+                   libv8.so libnet.so liburl.so; do
+            [ -f "$B/$f" ] && cp -a "$B/$f" "$D/chromium/" 2>/dev/null
+          done
 
-          # Widevine CDM
+          # strip
+          aarch64-linux-gnu-strip "$D/chromium/chrome" 2>/dev/null || true
+          find "$D/chromium/" -name "*.so" -exec aarch64-linux-gnu-strip {} + 2>/dev/null
+
+          # Widevine
           cp "$B/libwidevinecdm.so" "$D/widevine/"
           [ -f "$B/WidevineCdm/manifest.json" ] && cp "$B/WidevineCdm/manifest.json" "$D/widevine/"
 
@@ -193,15 +332,10 @@ jobs:
           cp "$GITHUB_WORKSPACE/widevine_fixup.py" "$D/"
           cp "$GITHUB_WORKSPACE/install.sh" "$D/"
 
-          # 打包
           cd /tmp
           tar czf "${PKG}.tar.gz" "$PKG/"
           ls -lh "${PKG}.tar.gz"
 
-          # 释放空间
-          rm -rf "$D"
-
-      # ========== Upload ==========
       - name: Upload artifact
         uses: actions/upload-artifact@v4
         with:
@@ -209,8 +343,7 @@ jobs:
           path: /tmp/chromium-widevine-aarch64-*.tar.gz
           retention-days: 90
 
-      # ========== Release ==========
-      - name: Create release
+      - name: Release
         uses: softprops/action-gh-release@v2
         with:
           tag_name: v${{ env.VERSION }}
@@ -219,7 +352,7 @@ jobs:
             ## Chromium ${{ env.VERSION }} with Widevine DRM
 
             **Target:** aarch64 Linux · 16K page size · Apple Silicon / Asahi Linux
-            **Method:** x86_64 cross-compilation on GitHub Actions
+            **Build:** x86_64 cross-compilation on GitHub Actions
 
             ### Install
             ```bash
