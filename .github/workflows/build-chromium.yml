@@ -51,7 +51,8 @@ jobs:
           git clone --depth 1 https://chromium.googlesource.com/chromium/tools/depot_tools.git $DEPOT_TOOLS
           echo "$DEPOT_TOOLS" >> $GITHUB_PATH
           export PATH="$DEPOT_TOOLS:$PATH"
-          gclient version
+          $DEPOT_TOOLS/update_depot_tools
+          python3 --version
 
       - name: Fetch Chromium
         run: |
@@ -184,8 +185,10 @@ jobs:
           git clone --depth 1 https://chromium.googlesource.com/chromium/tools/depot_tools.git $DEPOT_TOOLS
           echo "$DEPOT_TOOLS" >> $GITHUB_PATH
           export PATH="$DEPOT_TOOLS:$PATH"
-          # 必须 bootstrap，否则 gn 报 python3_bin_reldir.txt not found
-          gclient version
+          # 强制初始化 depot_tools（下载 python3 等）
+          $DEPOT_TOOLS/update_depot_tools
+          python3 --version
+          gn --version
 
       - name: Download pruned source
         uses: actions/download-artifact@v4
