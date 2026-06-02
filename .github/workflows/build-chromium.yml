@@ -134,6 +134,15 @@ jobs:
           find . -name "*.o" -delete 2>/dev/null
           find . -name "*.a" -delete 2>/dev/null
 
+          # 创建 stub 文件，避免 GN import 报错（chromeos/ 已删除但仍有引用）
+          mkdir -p chromeos/components/libsegmentation
+          cat > chromeos/components/libsegmentation/buildflags.gni << 'STUB'
+# Stub buildflags for libsegmentation (chromeos/ was pruned)
+declare_args() {
+  enable_libsegmentation = false
+}
+STUB
+
           echo "=== After prune ==="
           du -sh . 2>/dev/null
           df -h /
