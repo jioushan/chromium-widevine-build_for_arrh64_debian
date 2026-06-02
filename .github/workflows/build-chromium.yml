@@ -123,8 +123,8 @@ jobs:
           # 删除 NaCl/PNaCl
           rm -rf components/nacl* native_client/ pnacl/
 
-          # 删除 Rust 第三方库（保留 build/rust/，构建系统需要）
-          rm -rf third_party/rust/
+          # Rust 已是 Chromium 构建系统的必要依赖，不能删除
+          # rm -rf third_party/rust/ build/rust/
 
           # 删除大型测试/模拟框架
           rm -rf third_party/webgpu-cts/ third_party/dawn/
