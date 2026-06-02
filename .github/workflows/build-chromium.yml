@@ -93,6 +93,11 @@ jobs:
           python3 build/linux/sysroot_scripts/install-sysroot.py --arch=arm64
           gclient runhooks
 
+          # 诊断：检查 build/rust/ 目录
+          echo "=== Checking build/rust/ ==="
+          ls -la build/rust/ 2>/dev/null || echo "build/rust/ NOT FOUND"
+          ls -la build/rust/known-target-triples.txt 2>/dev/null || echo "known-target-triples.txt NOT FOUND"
+
       # ========== 极限裁剪源码 ==========
       - name: Prune source tree
         run: |
