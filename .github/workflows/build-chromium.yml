@@ -136,12 +136,7 @@ jobs:
 
           # 创建 stub 文件，避免 GN import 报错（chromeos/ 已删除但仍有引用）
           mkdir -p chromeos/components/libsegmentation
-          cat > chromeos/components/libsegmentation/buildflags.gni << 'STUB'
-# Stub buildflags for libsegmentation (chromeos/ was pruned)
-declare_args() {
-  enable_libsegmentation = false
-}
-STUB
+          printf '# Stub buildflags for libsegmentation (chromeos/ was pruned)\ndeclare_args() {\n  enable_libsegmentation = false\n}\n' > chromeos/components/libsegmentation/buildflags.gni
 
           echo "=== After prune ==="
           du -sh . 2>/dev/null
