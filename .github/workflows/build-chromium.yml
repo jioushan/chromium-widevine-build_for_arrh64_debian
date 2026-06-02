@@ -228,14 +228,14 @@ jobs:
             'target_os = "linux"' \
             'is_debug = false' \
             'is_official_build = true' \
-            'is_component_build = true' \
+            'is_component_build = false' \
             'symbol_level = 0' \
             'blink_symbol_level = 0' \
             'v8_symbol_level = 0' \
             'exclude_unwind_tables = true' \
             'enable_resource_allowlist_generation = false' \
             'dcheck_always_on = false' \
-            'use_custom_libcxx = false' \
+            'use_custom_libcxx = true' \
             'use_system_zlib = true' \
             'use_lld = true' \
             'is_cfi = false' \
